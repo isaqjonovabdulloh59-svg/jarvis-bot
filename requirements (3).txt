@@ -1,0 +1,6 @@
+python-telegram-bot[job-queue]==21.6
+openai
+httpx
+python-dotenv
+telethon
+gTTS
