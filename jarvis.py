@@ -49,7 +49,7 @@ if os.environ.get("RENDER"):
 
 load_dotenv("jarvis.env")
 ADMIN = int(os.environ["ADMIN_CHAT_ID"])
-VOICE_MODE[ADMIN] = True   # so'ralgani uchun standart yoqilgan
+# Standart o'chiq: faqat "ovozli ayt" desa yoki ovozli xabarga javoban ovoz keladi
 TZ = dt.timezone(dt.timedelta(hours=5))  # Toshkent
 
 # --- Kirish (autentifikatsiya) ---
@@ -138,7 +138,7 @@ Foydalanuvchi xabarlarni xohlagancha formatlab (ism yashirish,
 qisqartirish va h.k.) taqdim etishingni so'rasa, bemalol bajar.
 tg_send_message va
 rotate_bot_token, get_bot_token, update_profile, post_story,
-start_clock_name va start_always_online vositalarini faqat
+start_clock_name, start_always_online va render_set_env vositalarini faqat
 foydalanuvchining o'zi shuni so'ragan
 bo'lsagina chaqir; ular tasdiq kutadi, foydalanuvchiga ko'rsatib 'ha'
 deyishini so'ra. Tokenlarni hech qachon GitHub kodiga yozma, ular
@@ -171,6 +171,13 @@ TOOLS = [
           "title": {"type": "string"}, "body": {"type": "string"}},
          ["repo", "title"]),
     tool("render_services", "Render xizmatlari ro'yxati"),
+    tool("render_set_env",
+         "Render xizmatida environment-o'zgaruvchi (muhit o'zgaruvchisi) qiymatini "
+         "qo'yadi yoki yangilaydi, so'ng xizmatni qayta deploy qiladi (tasdiq kerak)",
+         {"service": {"type": "string", "description": "Render xizmat nomi"},
+          "key": {"type": "string", "description": "o'zgaruvchi nomi, masalan BOT_TOKEN"},
+          "value": {"type": "string"}},
+         ["service", "key", "value"]),
     tool("render_deploy",
          "Render xizmatini qayta deploy qiladi va tugagach foydalanuvchiga xabar beradi",
          {"service": {"type": "string",
@@ -239,8 +246,10 @@ def gh(method, path, **kw):
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     d = context.job.data
-    await context.bot.send_message(
-        d["chat"], f"⏰ *Eslatma*\n━━━━━━━━━━━━━━\n{d['text']}", parse_mode="Markdown")
+    md = f"⏰ *Eslatma*\n━━━━━━━━━━━━━━\n{d['text']}"
+    await safe_send(
+        lambda: context.bot.send_message(d["chat"], md, parse_mode="Markdown"),
+        lambda: context.bot.send_message(d["chat"], f"⏰ Eslatma\n{d['text']}"))
 
 def render_headers():
     return {"Authorization": f"Bearer {os.environ['RENDER_API_KEY']}"}
@@ -280,14 +289,20 @@ async def watch_deploy(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         status = ""
     if status in DONE:
-        await context.bot.send_message(
-            d["chat"], f"🛰️ *{d['name']}*\n{DONE[status]}", parse_mode="Markdown")
+        await safe_send(
+            lambda: context.bot.send_message(
+                d["chat"], f"🛰️ *{d['name']}*\n{DONE[status]}", parse_mode="Markdown"),
+            lambda: context.bot.send_message(
+                d["chat"], f"🛰️ {d['name']}\n{DONE[status]}"))
         context.job.schedule_removal()
     elif d["tries"] > 80:  # ~20 daqiqa
-        await context.bot.send_message(
-            d["chat"],
-            f"🛰️ *{d['name']}*\n⏱️ Deploy hali tugamadi, Render panelini tekshiring.",
-            parse_mode="Markdown")
+        await safe_send(
+            lambda: context.bot.send_message(
+                d["chat"],
+                f"🛰️ *{d['name']}*\n⏱️ Deploy hali tugamadi, Render panelini tekshiring.",
+                parse_mode="Markdown"),
+            lambda: context.bot.send_message(
+                d["chat"], f"🛰️ {d['name']}\n⏱️ Deploy hali tugamadi."))
         context.job.schedule_removal()
 
 def gh_put_file(repo, path, data, message):
@@ -617,7 +632,7 @@ async def get_bot_token(bot_username):
 # ---------- Tasdiq talab qiladigan amallar ----------
 SENSITIVE = {"tg_send_message", "rotate_bot_token", "get_bot_token",
              "update_profile", "post_story", "start_clock_name",
-             "start_always_online"}
+             "start_always_online", "render_set_env"}
 PENDING = {}    # chat_id -> (vosita, argumentlar)
 
 def describe(name, args):
@@ -629,6 +644,9 @@ def describe(name, args):
         cap = args.get("caption", "")
         return "Oxirgi yuklangan fayl Telegram Story sifatida joylanadi" + \
                (f", izoh: «{cap}»" if cap else "")
+    if name == "render_set_env":
+        return (f"`{args.get('service')}` xizmatida `{args.get('key')}` "
+                f"o'zgaruvchisini yangi qiymatga o'zgartirib, qayta deploy qilish")
     if name == "start_always_online":
         return "Shaxsiy Telegram profilingiz doimo 'onlayn' ko'rsatiladi (to'xtatguningizcha)"
     if name == "start_clock_name":
@@ -672,6 +690,22 @@ async def execute_sensitive(name, args, ctx, chat):
             peer="me", media=media, privacy_rules=[InputPrivacyValueAllowAll()],
             caption=args.get("caption") or "", period=86400))
         return "📖 *Story muvaffaqiyatli joylandi.*"
+    if name == "render_set_env":
+        sid, sname = find_service(args["service"])
+        r = httpx.put(
+            f"https://api.render.com/v1/services/{sid}/env-vars/{args['key']}",
+            json={"value": args["value"]}, timeout=30, headers=render_headers())
+        if r.status_code not in (200, 201):
+            raise ValueError(f"Render env-var yozilmadi: {r.status_code} {r.text[:200]}")
+        d = httpx.post(f"https://api.render.com/v1/services/{sid}/deploys",
+                       timeout=30, headers=render_headers())
+        if d.status_code in (200, 201):
+            ctx.job_queue.run_repeating(
+                watch_deploy, interval=15, first=15,
+                data={"sid": sid, "did": d.json().get("id"), "name": sname,
+                      "tries": 0, "chat": chat})
+        return (f"🔧 `{args['key']}` {sname} xizmatida yangilandi. "
+                f"Qayta deploy boshlandi, tugagach xabar beraman.")
     if name == "start_always_online":
         from telethon.tl.functions.account import UpdateStatusRequest
         async def ping(c):
@@ -717,12 +751,16 @@ async def execute_sensitive(name, args, ctx, chat):
 async def dispatch(name, args, ctx, chat):
     if name in SENSITIVE:
         PENDING[chat] = (name, args)
-        await ctx.bot.send_message(
-            chat,
-            "🔔 *Tasdiq talab qilinadi*\n━━━━━━━━━━━━━━\n"
-            + describe(name, args) +
-            "\n\n✅ Tasdiqlash uchun *ha* deb yozing.",
-            parse_mode="Markdown")
+        desc = describe(name, args)
+        await safe_send(
+            lambda: ctx.bot.send_message(
+                chat,
+                "🔔 *Tasdiq talab qilinadi*\n━━━━━━━━━━━━━━\n" + desc +
+                "\n\n✅ Tasdiqlash uchun *ha* deb yozing.",
+                parse_mode="Markdown"),
+            lambda: ctx.bot.send_message(
+                chat, "🔔 Tasdiq talab qilinadi\n" + desc +
+                "\n\nTasdiqlash uchun \"ha\" deb yozing."))
         return "Tasdiq so'rovi foydalanuvchiga allaqachon ko'rsatildi, qayta yozma."
     if name.startswith("tg_"):
         if tg is None:
@@ -737,6 +775,13 @@ async def dispatch(name, args, ctx, chat):
             await ctx.bot.send_voice(chat, f)
         return "✅ Ovozli xabar yuborildi."
     return run_tool(name, args, ctx)
+
+async def safe_send(coro_with_md, coro_without_md):
+    """Markdown xatosi (masalan nomda '_' bo'lsa) chiqsa, oddiy matn bilan qayta yuboradi."""
+    try:
+        return await coro_with_md()
+    except Exception:
+        return await coro_without_md()
 
 SPINNER = ["◐", "◓", "◑", "◒"]
 
@@ -875,7 +920,8 @@ async def handle_text(chat, text, update, ctx):
             await update.message.reply_text(final, parse_mode="Markdown")
         except Exception:
             await update.message.reply_text(final)
-        if VOICE_MODE.get(chat):
+        from_voice = chat in REPLY_LANG   # bu javob ovozli xabarga javobanmi
+        if VOICE_MODE.get(chat) or from_voice:
             try:
                 pref = REPLY_LANG.pop(chat, "uz")   # faqat shu bir javobga tegishli
                 path = await tts_save(final, chat, preferred=pref)
@@ -883,6 +929,7 @@ async def handle_text(chat, text, update, ctx):
                     await ctx.bot.send_voice(chat, f)
             except Exception as e:
                 print("Avto-ovoz xato:", e)
+        REPLY_LANG.pop(chat, None)
     except Exception as e:
         await update.message.reply_text(f"Xato: {e}")
 
@@ -917,10 +964,14 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tgfile = await ctx.bot.get_file(doc.file_id)
     await tgfile.download_to_drive(local_path)
     UPLOADS[chat] = local_path
-    await update.message.reply_text(
-        f"📎 *Fayl qabul qilindi*\n{doc.file_name} · {doc.file_size} bayt\n\n"
-        f"Endi nima qilishni ayting (masalan: \"shuni X repoga joyla\").",
-        parse_mode="Markdown")
+    await safe_send(
+        lambda: update.message.reply_text(
+            f"📎 *Fayl qabul qilindi*\n{doc.file_name} · {doc.file_size} bayt\n\n"
+            f"Endi nima qilishni ayting (masalan: \"shuni X repoga joyla\").",
+            parse_mode="Markdown"),
+        lambda: update.message.reply_text(
+            f"📎 Fayl qabul qilindi: {doc.file_name} ({doc.file_size} bayt)\n\n"
+            f"Endi nima qilishni ayting."))
     caption = (update.message.caption or "").strip()
     if caption:
         note = f"[Tizim: {doc.file_name} fayli allaqachon qabul qilinib, saqlandi. Qayta so'ramang.] "
