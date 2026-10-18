@@ -1,17 +1,261 @@
-import os, re, json, base64, zipfile, httpx, threading, asyncio, datetime as dt
+import os, re, json, base64, zipfile, httpx, threading, asyncio, html, shutil, subprocess, datetime as dt
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from telethon import TelegramClient, events
+from telethon.tl.types import User, MessageMediaWebPage
 from telegram import Update
 from telegram.ext import (ApplicationBuilder, MessageHandler, CommandHandler,
                           ContextTypes, filters)
 
 UPLOADS = {}   # chat_id -> oxirgi yuklangan faylning diskdagi manzili
-DEL_CACHE = {}    # (chat_id, msg_id) -> {"chat_name","sender","text","time"}
+DEL_CACHE = {}    # msg_id -> {"sender","username","text","time","label","kind","path","size"}
 DEL_ORDER = []    # DEL_CACHE hajmini cheklash uchun
+DEL_STATE = {"bytes": 0}
+DEL_MAX_ITEMS = 3000
+DEL_MAX_BYTES = 200 * 1024 * 1024     # o'chirilganlar uchun saqlanadigan media hajmi
+DEL_FILE_LIMIT = 20 * 1024 * 1024     # bitta media chegarasi
+MEDIA = {}        # chat_id -> oxirgi rasm/video yo'li (story uchun)
+UPLOAD_INFO = {}  # chat_id -> {"name","kind","size","announced"}
+IMG_EXT = ("jpg", "jpeg", "png", "webp")
+VID_EXT = ("mp4", "mov", "mkv", "webm", "avi", "m4v", "3gp")
+BOT_API_LIMIT = 20 * 1024 * 1024      # Bot API orqali yuklab olish chegarasi
 VOICE_MODE = {}   # chat_id -> True bo'lsa, har javob ovozli ham yuboriladi
 REPLY_LANG = {}   # chat_id -> ovozli javob uchun til (faqat ovozli xabardan keyin)
+
+def human_size(n):
+    n = float(n or 0)
+    for u in ("bayt", "KB", "MB", "GB"):
+        if n < 1024 or u == "GB":
+            return f"{n:.0f} {u}" if u == "bayt" else f"{n:.1f} {u}"
+        n /= 1024
+
+def file_ext(path):
+    base = os.path.basename(path)
+    return base.lower().rsplit(".", 1)[-1] if "." in base else ""
+
+def media_kind(path):
+    e = file_ext(path)
+    return "rasm" if e in IMG_EXT else "video" if e in VID_EXT else "fayl"
+
+# ---------- O'chirilgan xabarlar keshi ----------
+def del_cache_drop(mid):
+    e = DEL_CACHE.pop(mid, None)
+    if e and e.get("path"):
+        DEL_STATE["bytes"] = max(0, DEL_STATE["bytes"] - (e.get("size") or 0))
+        try:
+            os.remove(e["path"])
+        except Exception:
+            pass
+
+def del_cache_put(mid, entry):
+    DEL_CACHE[mid] = entry
+    DEL_STATE["bytes"] += entry.get("size") or 0
+    DEL_ORDER.append(mid)
+    while DEL_ORDER and (len(DEL_ORDER) > DEL_MAX_ITEMS
+                         or DEL_STATE["bytes"] > DEL_MAX_BYTES):
+        del_cache_drop(DEL_ORDER.pop(0))
+
+def media_info(msg):
+    """-> (yorliq, yuborish turi, saqlash kerakmi)"""
+    if not msg.media or isinstance(msg.media, MessageMediaWebPage):
+        return None, None, False
+    if msg.sticker:
+        return "🏷 stiker", None, False
+    if msg.gif:
+        return "🎞 GIF", None, False
+    if msg.voice:
+        label, kind = "🎤 ovozli xabar", "voice"
+    elif msg.video_note:
+        label, kind = "⭕ dumaloq video", "video_note"
+    elif msg.video:
+        label, kind = "🎬 video", "video"
+    elif msg.audio:
+        label, kind = "🎵 audio", "audio"
+    elif msg.photo:
+        label, kind = "🖼 rasm", "photo"
+    elif msg.document:
+        label, kind = "📎 fayl", "document"
+    else:
+        return "📦 media", None, False
+    size = (msg.file.size if msg.file and msg.file.size else 0)
+    ttl = getattr(msg.media, "ttl_seconds", None)   # o'z-o'zini o'chiruvchi mediani saqlamaymiz
+    return label, kind, (not ttl and size <= DEL_FILE_LIMIT)
+
+async def notify_deleted(bot, e, deleted_at):
+    who = html.escape(e["sender"])
+    if e.get("username"):
+        who += f" (@{html.escape(e['username'])})"
+    path, kind = e.get("path"), e.get("kind")
+    has_file = bool(path and kind and os.path.exists(path))
+
+    def build(limit):
+        lines = ["🗑 <b>Xabar o'chirildi</b>", f"👤 {who}",
+                 f"🕒 Yuborilgan {e['time']} · o'chirilgan {deleted_at}"]
+        if e.get("label"):
+            lines.append(e["label"])
+        if e.get("text"):
+            lines.append("\n" + html.escape(e["text"][:limit]))
+        return "\n".join(lines)
+
+    if has_file:
+        send = {"photo": bot.send_photo, "voice": bot.send_voice,
+                "video": bot.send_video, "audio": bot.send_audio,
+                "document": bot.send_document,
+                "video_note": bot.send_video_note}[kind]
+        try:
+            with open(path, "rb") as f:
+                if kind == "video_note":      # dumaloq videoga izoh qo'yib bo'lmaydi
+                    await send(ADMIN, f)
+                    await bot.send_message(ADMIN, build(1500), parse_mode="HTML")
+                else:
+                    await send(ADMIN, f, caption=build(500), parse_mode="HTML")
+            return
+        except Exception as ex:
+            print("O'chirilgan mediani yuborishda xato:", ex)
+    text = build(1500)
+    try:
+        await bot.send_message(ADMIN, text, parse_mode="HTML")
+    except Exception:
+        await bot.send_message(ADMIN, html.unescape(re.sub(r"<[^>]+>", "", text)))
+
+# ---------- Kelgan fayllarni yuklab olish ----------
+async def download_incoming(update, ctx, file_obj, local):
+    """20 MB gacha - Bot API; kattasi - shaxsiy akkaunt (Telethon) orqali."""
+    size = getattr(file_obj, "file_size", 0) or 0
+    err = None
+    if size <= BOT_API_LIMIT:
+        try:
+            f = await ctx.bot.get_file(file_obj.file_id)
+            await f.download_to_drive(local, read_timeout=300)
+            return local
+        except Exception as e:
+            err = e
+    if tg is None:
+        if size > BOT_API_LIMIT:
+            raise ValueError("fayl 20 MB dan katta, shaxsiy akkaunt ulanmagan (python tg_login.py)")
+        raise ValueError(f"yuklab bo'lmadi: {err}")
+    msg = await tg.get_messages(ctx.bot.username, ids=update.message.message_id)
+    if not msg or not msg.media:
+        raise ValueError("katta faylni shaxsiy akkaunt orqali topib bo'lmadi")
+    if size and msg.file and msg.file.size and msg.file.size != size:
+        raise ValueError("fayl mos kelmadi, qayta yuboring")
+    path = await tg.download_media(msg, file=local)
+    if not path:
+        raise ValueError("fayl yuklanmadi")
+    return path
+
+# ---------- Story ----------
+def probe_video(path):
+    """-> (davomiylik soniya, eni, bo'yi). hachoir yoki ffprobe orqali."""
+    dur = w = h = 0
+    try:
+        from hachoir.parser import createParser
+        from hachoir.metadata import extractMetadata
+        parser = createParser(path)
+        if parser:
+            with parser:
+                md = extractMetadata(parser)
+            if md:
+                if md.has("duration"):
+                    dur = int(md.get("duration").total_seconds())
+                if md.has("width"):
+                    w = int(md.get("width"))
+                if md.has("height"):
+                    h = int(md.get("height"))
+    except Exception as e:
+        print("Video metadata (hachoir):", e)
+    if (not dur or not w or not h) and shutil.which("ffprobe"):
+        try:
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height:format=duration",
+                 "-of", "json", path],
+                capture_output=True, text=True, timeout=30).stdout
+            j = json.loads(out)
+            st = (j.get("streams") or [{}])[0]
+            w = w or int(st.get("width") or 0)
+            h = h or int(st.get("height") or 0)
+            dur = dur or int(float((j.get("format") or {}).get("duration") or 0))
+        except Exception as e:
+            print("Video metadata (ffprobe):", e)
+    return dur or 10, w or 720, h or 1280
+
+def ensure_mp4(path):
+    """mp4 bo'lmasa va ffmpeg bor bo'lsa, mp4 (H.264) ga o'giradi."""
+    if file_ext(path) == "mp4" or not shutil.which("ffmpeg"):
+        return path
+    out = os.path.splitext(path)[0] + "_story.mp4"
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", path, "-c:v", "libx264", "-preset", "veryfast",
+             "-crf", "26", "-pix_fmt", "yuv420p", "-c:a", "aac",
+             "-movflags", "+faststart", out],
+            capture_output=True, timeout=900)
+        if r.returncode == 0 and os.path.exists(out):
+            return out
+    except Exception as e:
+        print("ffmpeg xato:", e)
+    return path
+
+STORY_ERRORS = {
+    "PREMIUM_ACCOUNT_REQUIRED": "Bu amal uchun Telegram Premium kerak.",
+    "STORIES_TOO_MUCH": "Story joylash limiti tugagan, birozdan so'ng urinib ko'ring.",
+    "STORY_PERIOD_INVALID": "Story muddati noto'g'ri (6, 12, 24 yoki 48 soat bo'lishi kerak).",
+    "MEDIA_FILE_INVALID": "Telegram bu faylni story sifatida qabul qilmadi (format/hajm).",
+    "MEDIA_INVALID": "Telegram bu faylni story sifatida qabul qilmadi (format/hajm).",
+    "FLOOD_WAIT": "Telegram vaqtincha cheklov qo'ydi, birozdan so'ng urinib ko'ring.",
+}
+
+def story_error(e):
+    es = str(e)
+    for k, v in STORY_ERRORS.items():
+        if k in es.upper():
+            return f"{v} ({k})"
+    return es
+
+async def post_story(chat, args):
+    from telethon.tl.functions.stories import SendStoryRequest
+    from telethon.tl.types import (
+        InputPeerSelf, InputMediaUploadedPhoto, InputMediaUploadedDocument,
+        DocumentAttributeVideo, DocumentAttributeFilename,
+        InputPrivacyValueAllowAll, InputPrivacyValueAllowContacts,
+        InputPrivacyValueAllowCloseFriends)
+    local = MEDIA.get(chat)
+    if not local or not os.path.exists(local):
+        raise ValueError("Story uchun avval rasm yoki video yuboring, hozircha hech narsa saqlanmagan.")
+    kind = media_kind(local)
+    rules = {"all": InputPrivacyValueAllowAll,
+             "contacts": InputPrivacyValueAllowContacts,
+             "close_friends": InputPrivacyValueAllowCloseFriends
+             }.get(args.get("privacy") or "all", InputPrivacyValueAllowAll)()
+    try:
+        hours = int(args.get("hours") or 24)
+    except Exception:
+        hours = 24
+    if hours not in (6, 12, 24, 48):
+        hours = 24
+    try:
+        if kind == "video":
+            local = await asyncio.to_thread(ensure_mp4, local)
+            dur, w, h = await asyncio.to_thread(probe_video, local)
+            f = await tg.upload_file(local)
+            media = InputMediaUploadedDocument(
+                file=f, mime_type="video/mp4",
+                attributes=[DocumentAttributeVideo(duration=float(dur), w=w, h=h,
+                                                   supports_streaming=True),
+                            DocumentAttributeFilename(os.path.basename(local))])
+        else:
+            f = await tg.upload_file(local)
+            media = InputMediaUploadedPhoto(file=f)
+        await tg(SendStoryRequest(
+            peer=InputPeerSelf(), media=media, privacy_rules=[rules],
+            caption=args.get("caption") or "", period=hours * 3600))
+    except Exception as e:
+        raise ValueError(story_error(e))
+    who = {"all": "hamma", "contacts": "faqat kontaktlar",
+           "close_friends": "yaqin do'stlar"}.get(args.get("privacy") or "all", "hamma")
+    return f"📖 *Story muvaffaqiyatli joylandi* ({hours} soat, ko'rinish: {who})."
 
 async def tts_save(text, chat, preferred=None):
     """Matnni ovozga aylantiradi. Google'da sof o'zbek ovozi yo'q,
@@ -143,6 +387,16 @@ foydalanuvchining o'zi shuni so'ragan
 bo'lsagina chaqir; ular tasdiq kutadi, foydalanuvchiga ko'rsatib 'ha'
 deyishini so'ra. Tokenlarni hech qachon GitHub kodiga yozma, ular
 Render Environment'da saqlanadi.
+Foydalanuvchi rasm yoki video yuborsa, u avtomatik diskka saqlanadi
+(xabar boshidagi [Tizim: ...] belgisi buni bildiradi). Foydalanuvchi
+"storyga/hikoyaga joyla" desa, post_story ni DARHOL chaqir: hech qachon
+"video yuboring" dema, chunki fayl allaqachon saqlangan. Tizim belgisi
+bo'lmasa ham post_story ni chaqir; fayl yo'q bo'lsa vositaning o'zi
+aytadi, faqat shundagina yuborishni so'ra. Foydalanuvchi muddat
+(6/12/24/48 soat) yoki kimlarga ko'rinishi (hamma/kontaktlar/yaqin
+do'stlar) haqida aytsa, hours va privacy parametrlariga yoz.
+O'chirilgan xabar haqidagi ogohlantirish avtomatik ishlaydi, buning
+uchun vosita chaqirma.
 Foydalanuvchi O'Z botining tokenini so'rasa, rad etma: get_bot_token
 vositasini chaqir (u tokenni faqat foydalanuvchining o'ziga yuboradi).
 Foydalanuvchi fayl (zip va h.k.) yuborsa, u diskka saqlanadi; keyin
@@ -211,8 +465,13 @@ TOOLS = [
          "Matnni ovozli xabarga aylantirib, shu chatga yuboradi (haqiqiy qo'ng'iroq emas, ovozli xabar)",
          {"text": {"type": "string"}}, ["text"]),
     tool("post_story",
-         "Foydalanuvchi yuborgan oxirgi rasm/videoni Telegram Story sifatida joylaydi (tasdiq kerak)",
-         {"caption": {"type": "string", "description": "ixtiyoriy izoh"}}),
+         "Foydalanuvchi botga yuborgan oxirgi rasm yoki videoni (u allaqachon saqlangan, qayta yuborishni "
+         "so'rama) Telegram Story/hikoya sifatida joylaydi (tasdiq kerak)",
+         {"caption": {"type": "string", "description": "ixtiyoriy izoh"},
+          "privacy": {"type": "string", "enum": ["all", "contacts", "close_friends"],
+                      "description": "kimga ko'rinadi: all (standart), contacts, close_friends"},
+          "hours": {"type": "integer", "enum": [6, 12, 24, 48],
+                    "description": "necha soat turadi (standart 24)"}}),
     tool("start_always_online",
          "Shaxsiy Telegram profilini doimo 'onlayn' holatda ko'rsatib turadi (tasdiq kerak)"),
     tool("stop_always_online",
@@ -464,35 +723,56 @@ async def start_userbot(application):
         if not event.is_private:
             return   # guruh/kanal xabarlari keshlanmaydi
         try:
-            key = (event.chat_id, event.id)
             sender = await event.get_sender()
-            DEL_CACHE[key] = {
-                "chat_name": sender_name(sender), "sender": sender_name(sender),
-                "text": (event.raw_text or "[media]")[:500],
+            # faqat oddiy odamlar: botlar, o'zim va Telegram xizmat akkaunti emas
+            if (not isinstance(sender, User) or sender.bot
+                    or getattr(sender, "is_self", False) or sender.id == 777000):
+                return
+            msg = event.message
+            label, kind, save = media_info(msg)
+            path, size = None, 0
+            if save:
+                try:
+                    os.makedirs("del_cache", exist_ok=True)
+                    path = await msg.download_media(
+                        file=os.path.join("del_cache", str(event.id)))
+                    size = os.path.getsize(path) if path else 0
+                except Exception as e:
+                    print("Mediani keshlashda xato:", e)
+                    path, size = None, 0
+            name = " ".join(filter(None, [sender.first_name, sender.last_name])) or "?"
+            del_cache_put(event.id, {
+                "sender": name, "username": sender.username,
+                "text": (event.raw_text or "")[:1500],
                 "time": dt.datetime.now(TZ).strftime("%H:%M"),
-            }
-            DEL_ORDER.append(key)
-            if len(DEL_ORDER) > 3000:
-                DEL_CACHE.pop(DEL_ORDER.pop(0), None)
+                "label": label, "kind": kind if path else None,
+                "path": path, "size": size})
         except Exception as e:
             print("Kesh xato:", e)
 
     @client.on(events.MessageDeleted())
     async def _on_delete(event):
-        # Guruh/kanal o'chirishlari har doim chat_id bilan keladi — ularni o'tkazib yuboramiz.
-        # Shaxsiy chat o'chirishlarida Telegram chat_id bermaydi (cid is None) — faqat shuni qayta ishlaymiz.
+        # Guruh/kanal o'chirishlari chat_id bilan keladi, ularni o'tkazib yuboramiz.
+        # Shaxsiy chat o'chirishlarida chat_id None bo'ladi; kesh esa faqat
+        # shaxsiy (botsiz) yozishmalardan to'ldiriladi.
         if event.chat_id is not None:
             return
         try:
-            for mid in event.deleted_ids:
-                matches = [(k, v) for k, v in list(DEL_CACHE.items()) if k[1] == mid]
-                for key, info in matches:
-                    DEL_CACHE.pop(key, None)
-                    await application.bot.send_message(
-                        ADMIN,
-                        f"🗑️ *Xabar o'chirildi* (shaxsiy)\n━━━━━━━━━━━━━━\n"
-                        f"{info['chat_name']} ({info['time']}):\n{info['text']}",
-                        parse_mode="Markdown")
+            items = sorted((m, DEL_CACHE[m]) for m in event.deleted_ids if m in DEL_CACHE)
+            if not items:
+                return
+            now = dt.datetime.now(TZ).strftime("%H:%M")
+            for mid, e in items[:10]:
+                try:
+                    await notify_deleted(application.bot, e, now)
+                except Exception as ex:
+                    print("O'chirilgan xabarni yuborishda xato:", ex)
+                del_cache_drop(mid)
+            for mid, _ in items[10:]:
+                del_cache_drop(mid)
+            if len(items) > 10:
+                await application.bot.send_message(
+                    ADMIN, f"🗑 Yana {len(items) - 10} ta xabar ham o'chirildi (jami {len(items)} ta).")
         except Exception as e:
             print("O'chirishni aniqlashda xato:", e)
 
@@ -642,8 +922,12 @@ def describe(name, args):
         return f"@{str(args.get('bot_username')).lstrip('@')} botining tokenini BotFather'dan olib, shu chatda ko'rsatish"
     if name == "post_story":
         cap = args.get("caption", "")
-        return "Oxirgi yuklangan fayl Telegram Story sifatida joylanadi" + \
-               (f", izoh: «{cap}»" if cap else "")
+        who = {"all": "hamma", "contacts": "faqat kontaktlar",
+               "close_friends": "yaqin do'stlar"}.get(args.get("privacy") or "all", "hamma")
+        fn = os.path.basename(MEDIA.get(CURRENT["chat"], "") or "fayl")
+        return (f"«{fn}» Telegram Story sifatida joylanadi · ko'rinish: {who} · "
+                f"muddat: {args.get('hours') or 24} soat" +
+                (f" · izoh: «{cap}»" if cap else ""))
     if name == "render_set_env":
         return (f"`{args.get('service')}` xizmatida `{args.get('key')}` "
                 f"o'zgaruvchisini yangi qiymatga o'zgartirib, qayta deploy qilish")
@@ -668,28 +952,7 @@ async def execute_sensitive(name, args, ctx, chat):
         await tg.send_message(await find_chat(args["chat"]), args["text"])
         return "📤 *Yuborildi.*"
     if name == "post_story":
-        from telethon.tl.functions.stories import SendStoryRequest
-        from telethon.tl.types import (InputPrivacyValueAllowAll,
-                                       InputMediaUploadedPhoto,
-                                       InputMediaUploadedDocument,
-                                       DocumentAttributeVideo,
-                                       DocumentAttributeFilename)
-        local = UPLOADS.get(chat)
-        if not local:
-            raise ValueError("Avval rasm yoki video yuboring.")
-        ext = local.lower().rsplit(".", 1)[-1]
-        f = await tg.upload_file(local)
-        if ext in ("mp4", "mov", "mkv", "webm"):
-            media = InputMediaUploadedDocument(
-                file=f, mime_type="video/mp4",
-                attributes=[DocumentAttributeVideo(duration=0, w=720, h=1280),
-                           DocumentAttributeFilename(os.path.basename(local))])
-        else:
-            media = InputMediaUploadedPhoto(file=f)
-        await tg(SendStoryRequest(
-            peer="me", media=media, privacy_rules=[InputPrivacyValueAllowAll()],
-            caption=args.get("caption") or "", period=86400))
-        return "📖 *Story muvaffaqiyatli joylandi.*"
+        return await post_story(chat, args)
     if name == "render_set_env":
         sid, sname = find_service(args["service"])
         r = httpx.put(
@@ -749,6 +1012,11 @@ async def execute_sensitive(name, args, ctx, chat):
     return await rotate_token(args["bot_username"], args["render_service"], ctx)
 
 async def dispatch(name, args, ctx, chat):
+    if name == "post_story":
+        p = MEDIA.get(chat)
+        if not p or not os.path.exists(p):
+            return ("Hali rasm yoki video saqlanmagan. Foydalanuvchidan uni "
+                    "shu chatga yuborishini so'rang, keyin qayta urining.")
     if name in SENSITIVE:
         PENDING[chat] = (name, args)
         desc = describe(name, args)
@@ -861,6 +1129,12 @@ async def handle_text(chat, text, update, ctx):
         await update.message.reply_text("🚫 *Amal bekor qilindi.*", parse_mode="Markdown")
         return
 
+    info = UPLOAD_INFO.get(chat)
+    if info and not info["announced"]:
+        info["announced"] = True
+        text = (f"[Tizim: foydalanuvchi {info['kind']} yubordi va u allaqachon qabul "
+                f"qilinib saqlandi ({info['name']}, {info['size']}). Qayta yuborishni "
+                f"so'rama, kerakli vositani darhol chaqir.] " + text)
     history.append({"role": "user", "content": text})
     try:
         for _ in range(6):  # vosita chaqiruvlari chegarasi
@@ -954,28 +1228,53 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     await handle_text(chat, text, update, ctx)
 
-async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Rasm, video, dumaloq video, GIF, audio va hujjatlarni qabul qiladi."""
     chat = update.effective_chat.id
     if chat not in AUTHORIZED:
         return   # fayl yuborishdan oldin parol kerak
-    doc = update.message.document
+    m = update.message
+    if m.photo:
+        obj, name = m.photo[-1], "photo.jpg"
+    elif m.video:
+        obj, name = m.video, m.video.file_name or "video.mp4"
+    elif m.video_note:
+        obj, name = m.video_note, "round.mp4"
+    elif m.animation:
+        obj, name = m.animation, m.animation.file_name or "animation.mp4"
+    elif m.audio:
+        obj, name = m.audio, m.audio.file_name or "audio.mp3"
+    elif m.document:
+        obj, name = m.document, m.document.file_name or "file"
+    else:
+        return
+    status = await m.reply_text("⏳ Qabul qilinmoqda…")
     os.makedirs("uploads", exist_ok=True)
-    local_path = os.path.join("uploads", f"{chat}_{doc.file_name}")
-    tgfile = await ctx.bot.get_file(doc.file_id)
-    await tgfile.download_to_drive(local_path)
-    UPLOADS[chat] = local_path
-    await safe_send(
-        lambda: update.message.reply_text(
-            f"📎 *Fayl qabul qilindi*\n{doc.file_name} · {doc.file_size} bayt\n\n"
-            f"Endi nima qilishni ayting (masalan: \"shuni X repoga joyla\").",
-            parse_mode="Markdown"),
-        lambda: update.message.reply_text(
-            f"📎 Fayl qabul qilindi: {doc.file_name} ({doc.file_size} bayt)\n\n"
-            f"Endi nima qilishni ayting."))
-    caption = (update.message.caption or "").strip()
+    safe = re.sub(r"[^\w.\-]+", "_", name)
+    local = os.path.join("uploads", f"{chat}_{m.message_id}_{safe}")
+    try:
+        local = await download_incoming(update, ctx, obj, local)
+    except Exception as e:
+        await status.edit_text(f"⚠️ Faylni qabul qilib bo'lmadi: {e}")
+        return
+    kind = media_kind(local)
+    UPLOADS[chat] = local
+    if kind in ("rasm", "video"):
+        MEDIA[chat] = local
+    size = human_size(os.path.getsize(local))
+    UPLOAD_INFO[chat] = {"name": name, "kind": kind, "size": size, "announced": False}
+    if kind in ("rasm", "video"):
+        hint = ("Endi ayting, masalan: «storyga joyla» yoki "
+                "«kontaktlarga ko'rinadigan 12 soatlik story qil».")
+    else:
+        hint = "Endi nima qilishni ayting (masalan: «shuni X repoga joyla»)."
+    try:
+        await status.edit_text(f"📎 Qabul qilindi: {name} · {size}\n\n{hint}")
+    except Exception:
+        pass
+    caption = (m.caption or "").strip()
     if caption:
-        note = f"[Tizim: {doc.file_name} fayli allaqachon qabul qilinib, saqlandi. Qayta so'ramang.] "
-        await handle_text(chat, note + caption, update, ctx)
+        await handle_text(chat, caption, update, ctx)
 
 builder = (ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"])
            .connect_timeout(30).read_timeout(30).write_timeout(30)
@@ -1019,6 +1318,8 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 app.add_handler(CommandHandler("start", on_start))
 app.add_handler(MessageHandler(filters.VOICE, on_voice))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-app.add_handler(MessageHandler(filters.Document.ALL, on_document))
+app.add_handler(MessageHandler(
+    filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.ANIMATION
+    | filters.AUDIO | filters.Document.ALL, on_media))
 asyncio.set_event_loop(asyncio.new_event_loop())
 app.run_polling()
